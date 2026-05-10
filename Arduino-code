@@ -1,0 +1,180 @@
+/*
+ * Projeto: Conecta-Publica-Altera.ino
+ * Descrição: Sistema IoT com Arduino Uno + Sensor DHT + Botão + LED + MQTT
+ * Hardware: Arduino Uno, Ethernet Shield, Sensor DHT11, Botão, LED
+ */
+
+// ===== BIBLIOTECAS =====
+#include <SPI.h>
+#include <Ethernet.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+
+// ===== CONFIGURAÇÕES DO SENSOR DHT (temperatura e umidade)=====
+#define DHTPIN 2
+#define DHTTYPE DHT11
+
+DHT dht(DHTPIN, DHTTYPE);
+
+// ===== PINOS DO CIRCUITO =====
+const int Botao = 8;
+const int Led_Verde = 9;
+bool ledVerdeState = false;
+bool clickDetected = false;
+int buttonState;
+
+// ===== ENDEREÇO MAC DA PLACA ETHERNET =====
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+
+// ===== IP FIXO PARA O ARDUINO (caso DHCP falhe) =====
+IPAddress staticIP(10, 0, 0, 20);
+
+// ===== IP DO BROKER MQTT ===== -> Sempre tem que ser atualizado quando a maquina reinicia
+IPAddress mqttServer(200,131,92,172);
+
+// ===== CLIENTES ETHERNET E MQTT =====
+EthernetClient ethClient;
+PubSubClient mqttClient(ethClient);
+
+// ===== CALLBACK MQTT (recebe mensagens do arduino) =====
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  
+  // Converte payload para string
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  // Debug: mostra mensagem recebida
+  Serial.print("Mensagem recebida em ");
+  Serial.print(topic);
+  Serial.print(": ");
+  Serial.println(message);
+  
+  // Controle do LED via MQTT (teste de conectividade entre Arduino -> Máquina 1-host mqtt)
+  if (message == "ON") {
+    digitalWrite(Led_Verde, HIGH);
+  } else if (message == "OFF") {
+    digitalWrite(Led_Verde, LOW);
+  }
+}
+
+// ===== SETUP INICIAL =====
+void setup() {
+  // Inicializa comunicação serial
+  Serial.begin(9600);
+  
+  // Conexão Ethernet
+  if (Ethernet.begin(mac) == 0) {
+    Serial.println("[ERRO] DHCP falhou, usando IP estático");
+    Ethernet.begin(mac, staticIP);
+  }
+  
+  delay(1000); // Aguarda estabilização
+  
+  // Configura broker MQTT
+  mqttClient.setServer(mqttServer, 1883);
+  mqttClient.setCallback(callback);
+  
+  // Tenta conexão inicial com broker
+  reconnectMQTT();
+  
+  // Configura pinos
+  pinMode(Botao, INPUT_PULLUP);
+  pinMode(Led_Verde, OUTPUT);
+  digitalWrite(Led_Verde, LOW);
+  
+  // Inicializa sensor DHT
+  dht.begin();
+  
+  delay(2000);
+}
+
+// ===== LOOP PRINCIPAL =====
+void loop() {
+  // Reconecta se necessário
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  
+  // Mantém conexão MQTT ativa
+  mqttClient.loop();
+  
+  // ===== LEITURA DO BOTÃO =====
+  buttonState = digitalRead(Botao);
+  
+  // Detecta clique (transição LOW → HIGH)
+  if (buttonState == LOW && !clickDetected) {
+    clickDetected = true;
+    
+    // Alterna estado do LED
+    ledVerdeState = !ledVerdeState;
+    digitalWrite(Led_Verde, ledVerdeState ? HIGH : LOW);
+    
+    // Publica estado no MQTT
+    mqttClient.publish("Bom Dia", ledVerdeState ? "ON" : "OFF");
+    Serial.println(ledVerdeState ? "LED ON" : "LED OFF");
+    
+    delay(150); // Debounce
+  }
+  
+  // Reseta detecção quando botão liberado
+  if (buttonState == HIGH) {
+    clickDetected = false;
+  }
+  
+  // ===== LEITURA DO SENSOR DHT =====
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+  
+  // Verifica se leitura é válida
+  if (isnan(temp) || isnan(hum)) {
+    Serial.println("Falha na leitura do sensor");
+  } else {
+    // Converte valores para string
+    char tempStr[8];
+    char humStr[8];
+    dtostrf(temp, 6, 2, tempStr);
+    dtostrf(hum, 6, 2, humStr);
+    
+    // Publica em tópicos separados (CORRIGIDO)
+    mqttClient.publish("Sensor/temperature", tempStr);
+    mqttClient.publish("Sensor/humidity", humStr);
+    
+    // Debug no serial monitor
+    Serial.print("Temp: ");
+    Serial.print(tempStr);
+    Serial.print(" | Umidade: ");
+    Serial.println(humStr);
+  }
+  
+  delay(2000); // Intervalo entre leituras
+}
+
+// ===== FUNÇÃO DE RECONEXÃO MQTT =====
+void reconnectMQTT() {
+  int tentativas = 0;
+  
+  // Tenta conectar até 3 vezes
+  while (!mqttClient.connected() && tentativas < 3) {
+    Serial.print("[MQTT] Conectando... (tentativa ");
+    Serial.print(tentativas + 1);
+    Serial.println("/3)");
+    
+    // Tentativa de conexão
+    if (mqttClient.connect("arduinoClient")) {
+      Serial.println("[MQTT] ✓ Conectado ao broker!");
+      mqttClient.subscribe("Bom Dia"); // Inscreve no tópico de controle
+    } else {
+      Serial.print("[MQTT] ✗ Falha, code: ");
+      Serial.println(mqttClient.state());
+      tentativas++;
+      delay(500); // Espera 500ms antes de tentar novamente
+    }
+  }
+  
+  // Feedback final
+  if (!mqttClient.connected()) {
+    Serial.println("[MQTT] Máximo de tentativas atingido!");
+  }
+}
